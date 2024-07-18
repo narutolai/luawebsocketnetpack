@@ -17,8 +17,8 @@
 #define HEADERSIZE 1024
 #define WEBSOCKET_HEADER_LEN  2
 #define WEBSOCKET_MASK_LEN    4
-#define MAX_PACKSIZE (64*1024) 
-#define MAX_PAYLOAD_NUM_PER_MSG 10 //一个消息最大会是几个数据帧 10个应该是极限了 
+#define MAX_PACKSIZE (64*1024)
+#define MAX_PAYLOAD_NUM_PER_MSG 10 //一个消息最大会是几个负载 10个应该是极限了 
 
 #define TYPE_DATA 1
 #define TYPE_MORE 2
@@ -34,7 +34,7 @@ struct netpack {
 };
 
 struct uncomplete {
-	struct netpack pack[MAX_PAYLOAD_NUM_PER_MSG]; 	//一个消息由几个数据帧构成
+	struct netpack pack[MAX_PAYLOAD_NUM_PER_MSG]; 	//这个只是数据帧的负载 payload
 	int cur_packet;
 	struct uncomplete * next;
 	uint8_t header[HEADERSIZE];
@@ -398,7 +398,6 @@ push_more(lua_State *L, int fd, uint8_t *buffer, int size, int wsocket_handeshak
 		memcpy(uc->pack[uc->cur_packet].buffer, buffer, uc->read);
 		return 1;
 	}
-
 	struct uncomplete decode_uc;
 	memset(&decode_uc, 0, sizeof(decode_uc));
 	decode_uc.mask = mask;
@@ -439,7 +438,7 @@ push_more(lua_State *L, int fd, uint8_t *buffer, int size, int wsocket_handeshak
 				uc->next = q->hash[h];
 				q->hash[h] = uc;	
 			}
-			uc->read = 0;
+			uc->read = -1;
             uc->mask = mask;
             uc->ismask = ismask;
 			uc->fin = fin;
@@ -458,16 +457,28 @@ push_more(lua_State *L, int fd, uint8_t *buffer, int size, int wsocket_handeshak
 		decode_wsmask_data(buffer, pack_size, &decode_uc);
 		struct uncomplete * uc = find_uncomplete(q, fd);
 		if(uc == NULL){
-			push_data(L, fd, buffer, pack_size, 1);	//再向queue中 push一条消息
-			buffer += pack_size;
-			size -= pack_size;
-			push_more(L, fd, buffer, size, wsocket_handeshake);
-			return 2;
+
+				push_data(L, fd, buffer, pack_size, 1);	//再向queue中 push一条消息
+				buffer += pack_size;
+				size -= pack_size;
+				push_more(L, fd, buffer, size, wsocket_handeshake);
+				return 2;
+			
+		
 		}
 		else 
 		{
 			int msg_size = uc->msgsize + pack_size;
-
+			if(msg_size > MAX_PACKSIZE)
+			{
+				skynet_free(uc);
+				buffer += pack_size;
+				size -= pack_size;
+				int res = push_more(L, fd, buffer, size, wsocket_handeshake);
+				return res;
+			}
+			else 
+			{
 				void * result = skynet_malloc(msg_size);
 				int offset  = 0;
 				for(int i =0; i < uc->cur_packet; ++i){
@@ -482,7 +493,7 @@ push_more(lua_State *L, int fd, uint8_t *buffer, int size, int wsocket_handeshak
 				size -= pack_size;
 				push_more(L, fd, buffer, size, wsocket_handeshake);
 				return 2;
-			
+			}
 		}
 	
 	}
@@ -497,7 +508,7 @@ push_more(lua_State *L, int fd, uint8_t *buffer, int size, int wsocket_handeshak
 				uc->next = q->hash[h];
 				q->hash[h] = uc;	
 			}
-			uc->read = 0;
+			uc->read = -1;
             uc->mask = mask;
             uc->ismask = ismask;
 			uc->fin = fin;
@@ -530,6 +541,16 @@ close_uncomplete(lua_State *L, int fd) {
 	}
 }
 
+int show_uc(struct uncomplete * uc)
+{
+	if(uc == NULL)return 0;
+	for(int i=0; i<uc->cur_packet; ++i)
+	{
+
+	}
+	return 0;
+}
+
 static int
 filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_handeshake) {
 	struct queue *q = lua_touserdata(L,1);
@@ -540,11 +561,10 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
     int ismask = 0;
     int hasunmask_size = 0;
 	int fin = 1;
- 
 	//一个uc可能是这些类型
 	//1.帧长度未读出， 即read ==-1
 	//2.帧长读完, 不完整的分帧 (fin=0,uc->read > 0)
-	//3.帧长读完, 完整的的分帧 (fin=0,uc->read = 0) // 来了第2个完整的分帧，但是没有读过
+	//3.帧长读完, 完整的的分帧 (fin=0,uc->read = 0) 
 	//4.帧长读完, 不完整的最后帧(fin=1,uc->read > 0)
 	if (uc) {
 		//1.上一个uc中没有读出帧长度
@@ -578,13 +598,13 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 				q->hash[h] = uc;
 				return 1;			
 			}
-
 			//取得包头长度以后开始生成新包
 			uc->pack[uc->cur_packet].buffer = skynet_malloc(pack_size);
 			uc->pack[uc->cur_packet].size = pack_size;
 			uc->mask = mask;
             uc->ismask = ismask;
             uc->hasunmask_size = hasunmask_size;
+			
 
 			//如果是握手协议则把header缓冲区的内容拷贝到缓冲区
             if (wsocket_handeshake) {
@@ -592,14 +612,13 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 				uc->read = uc->header_size < pack_size ? uc->header_size : pack_size;
 				memcpy(uc->pack[uc->cur_packet].buffer, uc->header, uc->read);
 				uc->fin = 1; //
-
             } 
             else {
+
             	uc->read = 0;
 				uc->fin = fin;
             }
 		}
-		
 		int need = uc->pack[uc->cur_packet].size - uc->read;
 		if (size < need) {
            	decode_wsmask_data(buffer, size, uc);
@@ -612,9 +631,8 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 			return 1;
 		}
 
-		// size >= need 可能要read一下 没有read 不知道是不是最后一个包
 		int hung_back = 1;
-		if(uc->fin == 1 && uc->read > 0) //4.如果是不完整的最后帧 变成完整的最后帧
+		if(uc->fin == 1 && uc->read >= 0) //4.如果是不完整的最后帧 变成完整的最后帧
 		{
 			decode_wsmask_data(buffer, need, uc);
 			memcpy(uc->pack[uc->cur_packet].buffer + uc->read, buffer, need);
@@ -632,14 +650,19 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 			size -= need;
 			if(size > 0)
 			{	
-				push_data(L,fd,result,uc->msgsize, 0);
-				skynet_free(uc);
-				push_more(L,fd,buffer, size,wsocket_handeshake);
-				lua_pushvalue(L, lua_upvalueindex(TYPE_MORE));
-				return 2;
+
+					push_data(L,fd,result,uc->msgsize, 0);
+					skynet_free(uc);
+
+					push_more(L,fd,buffer, size,wsocket_handeshake);
+					lua_pushvalue(L, lua_upvalueindex(TYPE_MORE));
+					return 2;
+				
+			
 			}
 			else
 			{	
+
 				lua_pushvalue(L, lua_upvalueindex(TYPE_DATA));
 				lua_pushinteger(L, fd);
 				lua_pushlightuserdata(L, result);
@@ -648,14 +671,14 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 				return 5;
 			}
 		}
-		else if(uc->fin == 0 && uc->read > 0)  // 如果是不完整分帧先把不完整的分帧 先变成完整的分帧
+		else if(uc->fin == 0 && uc->read >= 0)  // 如果是不完整分帧先把不完整的分帧 先变成完整的分帧
 		{	
 			//没有read过时 mask是取自原来的
 			decode_wsmask_data(buffer, need, uc);
 			memcpy(uc->pack[uc->cur_packet].buffer + uc->read, buffer, need);
 			uc->msgsize = uc->msgsize  + uc->pack[uc->cur_packet].size;
 			uc->cur_packet++;
-			uc->read = 0;
+			uc->read = -1;  //就是这个地方吧
 			
 
 			int h = hash_fd(fd);
@@ -702,7 +725,6 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 		//数据帧头大小
 		buffer+=pack_head_length;
 		size-=pack_head_length;
-		
 		//不够一个帧
 		if (size < pack_size && !wsocket_handeshake) {
 			struct uncomplete * uc = save_uncomplete(L, fd);
@@ -725,6 +747,7 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 		uc.hasunmask_size = hasunmask_size;
 		
 		if (size == pack_size && fin == 1) {
+
 			lua_pushvalue(L, lua_upvalueindex(TYPE_DATA));
 			lua_pushinteger(L, fd);
 			void * result = skynet_malloc(pack_size);
@@ -737,7 +760,7 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 		else if(size == pack_size && fin == 0)
 		{
 			struct uncomplete * uc = save_uncomplete(L, fd);
-			uc->read = 0;
+			uc->read = -1;
             uc->mask = mask;
             uc->ismask = ismask;
 			uc->fin = fin;
@@ -753,19 +776,19 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 		else if(size > pack_size && fin == 1)
 		{
 
-			decode_wsmask_data(buffer, pack_size, &uc);
-			push_data(L, fd, buffer, pack_size, 1);
-			buffer += pack_size;
-			size -= pack_size;
-			push_more(L, fd, buffer, size, wsocket_handeshake);
-			lua_pushvalue(L, lua_upvalueindex(TYPE_MORE));
-			return 2;
-
+				decode_wsmask_data(buffer, pack_size, &uc);
+				push_data(L, fd, buffer, pack_size, 1);
+				buffer += pack_size;
+				size -= pack_size;
+				push_more(L, fd, buffer, size, wsocket_handeshake);
+				lua_pushvalue(L, lua_upvalueindex(TYPE_MORE));
+				return 2;
+			
 		}
 		else if (size > pack_size && fin == 0)
 		{
 			struct uncomplete * uc = save_uncomplete(L, fd);
-			uc->read = 0;
+			uc->read = -1;
             uc->mask = mask;
             uc->ismask = ismask;
 			uc->fin = fin;
