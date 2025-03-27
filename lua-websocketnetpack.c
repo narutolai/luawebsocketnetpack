@@ -218,16 +218,8 @@ read_size(uint8_t * buffer, int size, int* pack_head_length, int* mask, int * is
 	}
 	
 	char fin = (buffer[0] >> 7) & 0x1;
-    // char rsv1 = (buffer[0] >> 6) & 0x1;
-    // char rsv2 = (buffer[0] >> 5) & 0x1;
-    // char rsv3 = (buffer[0] >> 4) & 0x1;
-    // char opcode = buffer[0] & 0xf;
     char is_mask = (buffer[1] >> 7) & 0x1;
 
-    //printf("read_size2 fin=%d rsv1=%d rsv2=%d rsv3=%d opcode=%d is_mask=%d\n", fin, rsv1, rsv2, rsv3, opcode, is_mask);
-    // if (0x0 != rsv1 || 0x0 != rsv2 || 0x0 != rsv3 || opcode == 0) {
-    //     return -2;
-    // } 
 
 	//本数据帧不是最后一个数据帧
 
@@ -408,12 +400,17 @@ push_more(lua_State *L, int fd, uint8_t *buffer, int size, int wsocket_handeshak
 		decode_wsmask_data(buffer, pack_size, &decode_uc);
 		struct uncomplete * uc = find_uncomplete(q, fd);
 		if(uc == NULL){
+			if(pack_size > MAX_PACKSIZE)
+			{
+				return 1;	
+			}
 			push_data(L, fd, buffer, pack_size, 1);	//再向queue中 push一条消息
 			return 2;
 		}
 		else 
 		{	
 			int msg_size = uc->msgsize + pack_size;
+			if(msg_size > MAX_PACKSIZE) {return 1;}
 			void * result = skynet_malloc(msg_size);
 			int offset  = 0;
 			for(int i =0; i < uc->cur_packet; ++i){
@@ -457,13 +454,21 @@ push_more(lua_State *L, int fd, uint8_t *buffer, int size, int wsocket_handeshak
 		decode_wsmask_data(buffer, pack_size, &decode_uc);
 		struct uncomplete * uc = find_uncomplete(q, fd);
 		if(uc == NULL){
-
+			if(pack_size > MAX_PACKSIZE)
+			{
+				buffer += pack_size;
+				size -= pack_size;
+				int res = push_more(L, fd, buffer, size, wsocket_handeshake);
+				return res;
+			}
+			else
+			{
 				push_data(L, fd, buffer, pack_size, 1);	//再向queue中 push一条消息
 				buffer += pack_size;
 				size -= pack_size;
 				push_more(L, fd, buffer, size, wsocket_handeshake);
 				return 2;
-			
+			}
 		
 		}
 		else 
@@ -650,19 +655,36 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 			size -= need;
 			if(size > 0)
 			{	
-
+				//如果消息超过了最大帧长度
+				if(uc->msgsize > MAX_PACKSIZE)
+				{
+					skynet_free(uc);
+					int res = push_more(L,fd,buffer, size,wsocket_handeshake);
+					if(res ==2)
+					{
+						lua_pushvalue(L, lua_upvalueindex(TYPE_MORE));
+						return 2;	
+					}
+					return 1;
+				}
+				else 
+				{
 					push_data(L,fd,result,uc->msgsize, 0);
 					skynet_free(uc);
 
 					push_more(L,fd,buffer, size,wsocket_handeshake);
 					lua_pushvalue(L, lua_upvalueindex(TYPE_MORE));
 					return 2;
-				
+				}
 			
 			}
 			else
 			{	
-
+				if(uc->msgsize > MAX_PACKSIZE) 
+				{
+					skynet_free(uc);
+					return 1;
+				}
 				lua_pushvalue(L, lua_upvalueindex(TYPE_DATA));
 				lua_pushinteger(L, fd);
 				lua_pushlightuserdata(L, result);
@@ -747,7 +769,9 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 		uc.hasunmask_size = hasunmask_size;
 		
 		if (size == pack_size && fin == 1) {
-
+			if(pack_size > MAX_PACKSIZE){
+				return 1;
+			}
 			lua_pushvalue(L, lua_upvalueindex(TYPE_DATA));
 			lua_pushinteger(L, fd);
 			void * result = skynet_malloc(pack_size);
@@ -775,7 +799,18 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 		}
 		else if(size > pack_size && fin == 1)
 		{
-
+			if(pack_size > MAX_PACKSIZE){
+				buffer += pack_size;
+				size -= pack_size;
+				int res = push_more(L, fd, buffer, size, wsocket_handeshake);
+				if (res == 2){
+					lua_pushvalue(L, lua_upvalueindex(TYPE_MORE));
+					return 2;
+				}
+				return 1;
+			}
+			else 
+			{
 				decode_wsmask_data(buffer, pack_size, &uc);
 				push_data(L, fd, buffer, pack_size, 1);
 				buffer += pack_size;
@@ -783,7 +818,7 @@ filter_data_(lua_State *L, int fd, uint8_t * buffer, int size, int wsocket_hande
 				push_more(L, fd, buffer, size, wsocket_handeshake);
 				lua_pushvalue(L, lua_upvalueindex(TYPE_MORE));
 				return 2;
-			
+			}
 		}
 		else if (size > pack_size && fin == 0)
 		{
